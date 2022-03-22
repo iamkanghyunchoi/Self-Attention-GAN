@@ -7,9 +7,47 @@ import datetime
 import torch.nn as nn
 from torch.autograd import Variable
 from torchvision.utils import save_image
+from torchvision.transforms.functional import to_tensor
+from torchvision import transforms
 
 from sagan_models import Generator, Discriminator
 from utils import *
+
+from pytorch_gan_metrics import get_fid
+from pytorch_gan_metrics.core import get_inception_feature, calculate_frechet_inception_distance
+from torch.utils.data import Dataset
+from data_loader import GeneratorDataset, squeeze_batch, ImageDataset #, omit_label_batch
+
+import logging
+
+def torch_cov(m, rowvar=False):
+    '''Estimate a covariance matrix given data.
+    Covariance indicates the level to which two variables vary together.
+    If we examine N-dimensional samples, `X = [x_1, x_2, ... x_N]^T`,
+    then the covariance matrix element `C_{ij}` is the covariance of
+    `x_i` and `x_j`. The element `C_{ii}` is the variance of `x_i`.
+    Args:
+        m: A 1-D or 2-D array containing multiple variables and observations.
+            Each row of `m` represents a variable, and each column a single
+            observation of all those variables.
+        rowvar: If `rowvar` is True, then each row represents a
+            variable, with observations in the columns. Otherwise, the
+            relationship is transposed: each column represents a variable,
+            while the rows contain observations.
+    Returns:
+        The covariance matrix of the variables.
+    '''
+    if m.dim() > 2:
+        raise ValueError('m has more than 2 dimensions')
+    if m.dim() < 2:
+        m = m.view(1, -1)
+    if not rowvar and m.size(0) != 1:
+        m = m.t()
+    # m = m.type(torch.double)  # uncomment this line if desired
+    fact = 1.0 / (m.size(1) - 1)
+    m -= torch.mean(m, dim=1, keepdim=True)
+    mt = m.t()  # if complex: mt = m.t().conj()
+    return fact * m.matmul(mt).squeeze()
 
 class Trainer(object):
     def __init__(self, data_loader, config):
@@ -52,6 +90,9 @@ class Trainer(object):
         self.model_save_step = config.model_save_step
         self.version = config.version
 
+        self.calc_fid = config.calc_fid
+        self.fid_stat_path = config.fid_stat_path
+
         # Path
         self.log_path = os.path.join(config.log_path, self.version)
         self.sample_path = os.path.join(config.sample_path, self.version)
@@ -66,6 +107,74 @@ class Trainer(object):
         if self.pretrained_model:
             self.load_pretrained_model()
 
+        self.logger = self.set_logger()
+
+        self.realtime_fid = config.realtime_fid
+
+        if self.calc_fid and self.realtime_fid:
+            self.calc_fid_stat()
+
+    def transform(self, resize, totensor, normalize, centercrop):
+        options = []
+        if centercrop:
+            options.append(transforms.CenterCrop(160))
+        if resize:
+            options.append(transforms.Resize((self.imsize,self.imsize)))
+        if totensor:
+            options.append(transforms.ToTensor())
+        if normalize:
+            options.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+        transform = transforms.Compose(options)
+        return transform
+
+    def calc_fid_stat(self):
+        transforms = self.transform(True,True,True,True)
+        temp_dataset = ImageDataset(self.image_path+'/CelebA/celeba', exts=['png', 'jpg'], transform=transforms) #### HARD CODED
+        fid_data_loader = torch.utils.data.DataLoader(temp_dataset, batch_size=50, num_workers=2)
+        acts, = get_inception_feature(fid_data_loader, dims=[2048], verbose=True, use_torch=True)
+
+        del temp_dataset
+        del fid_data_loader
+
+        self.fid_mu = torch.mean(acts, axis=0)
+        self.fid_sigma = torch_cov(acts,rowvar=False)
+
+    def calc_fid_score(self):
+        pseudo_dataset = GeneratorDataset(self.G, z_dim=self.z_dim, batch_size=50)
+        pseudo_loader = torch.utils.data.DataLoader(pseudo_dataset, batch_size=1, num_workers=0, collate_fn=squeeze_batch)
+        # print(len(pseudo_loader.dataset))
+        # raise TypeError
+        # for i in pseudo_loader:
+        #     print(i.shape)
+        #     raise TypeError
+        if self.realtime_fid:
+            acts, = get_inception_feature(pseudo_loader, dims=[2048], use_torch=True)
+            FID = calculate_frechet_inception_distance(acts, self.fid_mu, self.fid_sigma, True)
+        else:
+            FID = get_fid(pseudo_loader, self.fid_stat_path, use_torch=True)
+
+        del pseudo_dataset
+        del pseudo_loader
+
+        return FID
+
+    def set_logger(self):
+        logger = logging.getLogger('baseline')
+        file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+        console_formatter = logging.Formatter('%(message)s')
+        # file log
+        file_handler = logging.FileHandler(os.path.join(self.log_path, "training.log"))
+        file_handler.setFormatter(file_formatter)
+        
+        # console log
+        # console_handler = logging.StreamHandler(sys.stdout)
+        # console_handler.setFormatter(console_formatter)
+        
+        logger.addHandler(file_handler)
+        # logger.addHandler(console_handler)
+        
+        logger.setLevel(logging.INFO)
+        return logger
 
 
     def train(self):
@@ -173,14 +282,25 @@ class Trainer(object):
                 print("Elapsed [{}], G_step [{}/{}], D_step[{}/{}], d_out_real: {:.4f}, "
                       " ave_gamma_l3: {:.4f}, ave_gamma_l4: {:.4f}".
                       format(elapsed, step + 1, self.total_step, (step + 1),
-                             self.total_step , d_loss_real.data[0],
-                             self.G.attn1.gamma.mean().data[0], self.G.attn2.gamma.mean().data[0] ))
+                             self.total_step , d_loss_real.item(),
+                             self.G.attn1.gamma.mean().item(), self.G.attn2.gamma.mean().item() ))
 
             # Sample images
             if (step + 1) % self.sample_step == 0:
                 fake_images,_,_= self.G(fixed_z)
                 save_image(denorm(fake_images.data),
                            os.path.join(self.sample_path, '{}_fake.png'.format(step + 1)))
+
+                self.logger.info("Elapsed [{}], G_step [{}/{}], D_step[{}/{}], d_out_real: {:.4f}, "
+                      " ave_gamma_l3: {:.4f}, ave_gamma_l4: {:.4f}".
+                      format(elapsed, step + 1, self.total_step, (step + 1),
+                             self.total_step , d_loss_real.item(),
+                             self.G.attn1.gamma.mean().item(), self.G.attn2.gamma.mean().item() ))
+
+                if self.calc_fid:
+                    fid_score = self.calc_fid_score()
+                    print("FID SCORE:",fid_score)
+                    self.logger.info(f"FID SCORE: {fid_score}")
 
             if (step+1) % model_save_step==0:
                 torch.save(self.G.state_dict(),
