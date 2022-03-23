@@ -57,6 +57,7 @@ class Trainer(object):
 
         # exact model and loss
         self.model = config.model
+        self.d_model = config.d_model
         self.adv_loss = config.adv_loss
 
         # Model hyper-parameters
@@ -279,11 +280,19 @@ class Trainer(object):
             if (step + 1) % self.log_step == 0:
                 elapsed = time.time() - start_time
                 elapsed = str(datetime.timedelta(seconds=elapsed))
+
+                if self.model == "sagan":
+                    gamma_l3 = self.G.attn1.gamma.mean().item()
+                    gamma_l4 = self.G.attn2.gamma.mean().item()
+                else:
+                    gamma_l3 = 0.0
+                    gamma_l4 = 0.0
+
                 print("Elapsed [{}], G_step [{}/{}], D_step[{}/{}], d_out_real: {:.4f}, "
                       " ave_gamma_l3: {:.4f}, ave_gamma_l4: {:.4f}".
                       format(elapsed, step + 1, self.total_step, (step + 1),
                              self.total_step , d_loss_real.item(),
-                             self.G.attn1.gamma.mean().item(), self.G.attn2.gamma.mean().item() ))
+                             gamma_l3, gamma_l4 ))
 
             # Sample images
             if (step + 1) % self.sample_step == 0:
@@ -291,11 +300,18 @@ class Trainer(object):
                 save_image(denorm(fake_images.data),
                            os.path.join(self.sample_path, '{}_fake.png'.format(step + 1)))
 
+                if self.model == "sagan":
+                    gamma_l3 = self.G.attn1.gamma.mean().item()
+                    gamma_l4 = self.G.attn2.gamma.mean().item()
+                else:
+                    gamma_l3 = 0.0
+                    gamma_l4 = 0.0
+
                 self.logger.info("Elapsed [{}], G_step [{}/{}], D_step[{}/{}], d_out_real: {:.4f}, "
                       " ave_gamma_l3: {:.4f}, ave_gamma_l4: {:.4f}".
                       format(elapsed, step + 1, self.total_step, (step + 1),
                              self.total_step , d_loss_real.item(),
-                             self.G.attn1.gamma.mean().item(), self.G.attn2.gamma.mean().item() ))
+                             gamma_l3, gamma_l4 ))
 
                 if self.calc_fid:
                     fid_score = self.calc_fid_score()
@@ -310,8 +326,8 @@ class Trainer(object):
 
     def build_model(self):
 
-        self.G = Generator(self.batch_size,self.imsize, self.z_dim, self.g_conv_dim).cuda()
-        self.D = Discriminator(self.batch_size,self.imsize, self.d_conv_dim).cuda()
+        self.G = Generator(self.batch_size,self.imsize, self.z_dim, self.g_conv_dim, self.model).cuda()
+        self.D = Discriminator(self.batch_size,self.imsize, self.d_conv_dim, self.d_model).cuda()
         if self.parallel:
             self.G = nn.DataParallel(self.G)
             self.D = nn.DataParallel(self.D)

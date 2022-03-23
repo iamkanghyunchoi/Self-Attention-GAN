@@ -23,7 +23,7 @@ def main(config):
 
 
     if config.train:
-        if config.model=='sagan':
+        if config.model in ['sagan', 'gmlp']:
             trainer = Trainer(data_loader.loader(), config)
         elif config.model == 'qgan':
             trainer = qgan_trainer(data_loader.loader(), config)
